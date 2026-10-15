@@ -51,6 +51,15 @@ public class VRJumpMotor : MonoBehaviour
         if (_ownsAction) _jump?.Dispose();
     }
 
+    /// <summary>Launches the player up as if jumping with this many times the normal jump height (used by spring pads).</summary>
+    public void LaunchWithMultiplier(float multiplier) => Launch(jumpHeight * multiplier);
+
+    /// <summary>Launches the player up to roughly this height (in meters).</summary>
+    public void Launch(float height)
+    {
+        _velY = Mathf.Sqrt(Mathf.Max(0.01f, height) * -2f * gravity);
+    }
+
     /// <summary>Called after teleporting/respawning so old fall speed is discarded.</summary>
     public void ResetVelocity() => _velY = 0f;
 
