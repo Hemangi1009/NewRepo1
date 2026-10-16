@@ -52,6 +52,10 @@ public class LocalXROriginProvider : MonoBehaviour
     [SerializeField] private float fadeOutDuration = 0.5f;
     [SerializeField] private float fadeInDuration = 0.5f;
 
+    [Header("Checkpoints")]
+    [Tooltip("ON: after a fall, the player respawns at the last checkpoint THEY reached (if any). OFF: always at the start spawn.")]
+    [SerializeField] private bool useCheckpointRespawn = true;
+
     [Header("Optional: extra components to switch off while respawning (movement providers are found automatically)")]
     [SerializeField] private Behaviour[] disableDuringRespawn;
 
@@ -61,7 +65,10 @@ public class LocalXROriginProvider : MonoBehaviour
 
     public Transform Root => xrOriginRoot != null ? xrOriginRoot : transform;
 
-    /// <summary>This player's spawn pose. SpawnPosition = where the player's HEAD/body should stand (on the ground).</summary>
+    /// <summary>
+    /// This player's CURRENT respawn pose. SpawnPosition = where the player's HEAD/body should stand (on the ground).
+    /// It starts as the start spawn and becomes the last checkpoint after the first respawn at a checkpoint.
+    /// </summary>
     public bool HasSpawn { get; private set; }
     public Vector3 SpawnPosition { get; private set; }
     public Quaternion SpawnRotation { get; private set; }
@@ -165,10 +172,47 @@ public class LocalXROriginProvider : MonoBehaviour
         _settling = false;
     }
 
-    /// <summary>Sends the player's head back to this player's spawn point.</summary>
+    /// <summary>
+    /// Sends the player's head back to this player's respawn point:
+    /// the last checkpoint this player reached, or the start spawn if there is none.
+    /// </summary>
     public void RespawnAtSpawn()
     {
-        if (HasSpawn) PlaceHeadAt(SpawnPosition, SpawnRotation);
+        if (!HasSpawn) return;
+
+        ApplyCheckpointAsSpawn();
+        PlaceHeadAt(SpawnPosition, SpawnRotation);
+    }
+
+    /// <summary>
+    /// If the local player has reached a checkpoint, makes it the current spawn (snapped to the ground).
+    /// The checkpoint is stored per player (per machine), so another player's checkpoint is never used.
+    /// </summary>
+    private void ApplyCheckpointAsSpawn()
+    {
+        if (!useCheckpointRespawn)
+        {
+            Debug.Log("[LocalXROriginProvider] Checkpoint respawn is switched off, using the normal spawn.");
+            return;
+        }
+
+        if (!Checkpoint.TryGetRespawnPose(out Vector3 cpPos, out Quaternion cpRot))
+        {
+            Debug.Log($"[LocalXROriginProvider] No checkpoint reached yet, respawning at the normal spawn {SpawnPosition}.");
+            return;
+        }
+
+        Vector3 safe = ResolveSafePosition(cpPos, out bool usedFallback);
+        if (usedFallback)
+        {
+            Debug.LogWarning($"[LocalXROriginProvider] The checkpoint at {cpPos} has NO WALKABLE GROUND below it, so it cannot be used. " +
+                             $"Respawning at the normal spawn {SpawnPosition} instead. Move the checkpoint (or its Respawn Point) above a collider.");
+            return;
+        }
+
+        SpawnPosition = safe;
+        SpawnRotation = cpRot;
+        Debug.Log($"[LocalXROriginProvider] Respawning at the CHECKPOINT: {cpPos} -> {safe} (yaw {cpRot.eulerAngles.y:F0}).");
     }
 
     /// <summary>Respawn at the XR Origin's original scene position from now on.</summary>
@@ -259,7 +303,7 @@ public class LocalXROriginProvider : MonoBehaviour
                 }
             }
 
-            Debug.Log("[LocalXROriginProvider] Fall respawn is active (v6, handled here).");
+            Debug.Log("[LocalXROriginProvider] Fall respawn is active (v7, checkpoint aware).");
             return;
         }
     }
@@ -267,7 +311,7 @@ public class LocalXROriginProvider : MonoBehaviour
     private IEnumerator FallRespawnRoutine()
     {
         _respawning = true;
-        Debug.Log($"[LocalXROriginProvider] Fall detected. Rig={Root.position}, spawn={SpawnPosition}");
+        Debug.Log($"[LocalXROriginProvider] Fall detected. Rig={Root.position}, current spawn={SpawnPosition}, hasCheckpoint={Checkpoint.HasCheckpoint}");
 
         var fader = VRScreenFader.Instance;
         float hold = Mathf.Max(0f, totalDuration - fadeOutDuration - fadeInDuration);
@@ -278,7 +322,8 @@ public class LocalXROriginProvider : MonoBehaviour
         // 1b) Screen is fully black now: freeze everything so nothing moves during the respawn
         SetMovementLocked(true);
 
-        // 2) Black screen: clear the leftover fall speed and put the HEAD on this player's own spawn point
+        // 2) Black screen: clear the leftover fall speed and put the HEAD on this player's own respawn point
+        //    (their last checkpoint, or the start spawn when they have none)
         ResetFallVelocity();
         RespawnAtSpawn();
 
