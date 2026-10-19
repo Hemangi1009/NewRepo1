@@ -86,7 +86,7 @@ VFXRenderer:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 945467463689978545}
-  m_Enabled: 0
+  m_Enabled: 1
   m_CastShadows: 1
   m_ReceiveShadows: 0
   m_DynamicOccludee: 1
@@ -175,6 +175,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::HandBall
   ballName: Ball
+  verboseLogs: 0
   startScale: 0.05
   endScale: 0.1
   growTime: 1.5
@@ -185,8 +186,24 @@ MonoBehaviour:
     serializedVersion: 2
     m_Bits: 4294967291
   hitLingerTime: 1.5
-  hitEffectPrefab: {fileID: 0}
+  hitEffectPrefab: {fileID: 2014342617017287826, guid: ee28833a30e60f24396fd6e98279c07f, type: 3}
   hitEffectLifetime: 3
+  effectAlignment: 0
+  showHitEffectToHitPlayer: 1
+  victimEffectPrefab: {fileID: 2014342617017287826, guid: ee28833a30e60f24396fd6e98279c07f, type: 3}
+  victimEffectDistance: 1.5
+  victimEffectScale: 0.5
+  launchSfx: {fileID: 8300000, guid: 13e399440a06e184487ca8313b5a4817, type: 3}
+  launchSfxVolume: 0.5
+  hitSfx: {fileID: 8300000, guid: a1ff7f18dde2af6428211716b4e201d7, type: 3}
+  hitSfxVolume: 0.5
+  sfxMaxDistance: 30
+  playerHitEffect: 1
+  knockbackDistance: 1.5
+  knockbackDuration: 0.35
+  freezeSeconds: 3
+  hitHapticStrength: 1
+  hitHapticDuration: 0.6
   _NetState: 0
   _Charge: 0
 --- !u!1 &4571691764065797012

@@ -52,12 +52,41 @@ public class LocalXROriginProvider : MonoBehaviour
     [SerializeField] private float fadeOutDuration = 0.5f;
     [SerializeField] private float fadeInDuration = 0.5f;
 
+    [Header("Sounds: fall")]
+    [Tooltip("Played once when the player falls and is about to respawn. Leave empty for no sound.")]
+    [SerializeField] private AudioClip fallSfx;
+    [Range(0f, 1f)]
+    [SerializeField] private float fallSfxVolume = 1f;
+
+    [Header("Sounds: jump")]
+    [Tooltip("Played when the player jumps. Leave empty for no sound.")]
+    [SerializeField] private AudioClip jumpSfx;
+    [Range(0f, 1f)]
+    [SerializeField] private float jumpSfxVolume = 1f;
+    [Tooltip("Random pitch change so the sound does not feel the same every time. 0 = always the same, 0.08 = a little variety.")]
+    [Range(0f, 0.3f)]
+    [SerializeField] private float jumpPitchVariation = 0.06f;
+
+    [Tooltip("Minimum seconds between two jump sounds.")]
+    [SerializeField] private float jumpSfxCooldown = 0.2f;
+
     [Header("Checkpoints")]
     [Tooltip("ON: after a fall, the player respawns at the last checkpoint THEY reached (if any). OFF: always at the start spawn.")]
     [SerializeField] private bool useCheckpointRespawn = true;
 
     [Header("Optional: extra components to switch off while respawning (movement providers are found automatically)")]
     [SerializeField] private Behaviour[] disableDuringRespawn;
+
+    [Header("Debug")]
+    [Tooltip("Print debug messages (editor only). Keep OFF while testing performance: Debug.Log is slow, especially on Quest.")]
+    [SerializeField] private bool verboseLogs = false;
+
+    // Calls to this are removed completely from builds, including the work of building the message text.
+    [System.Diagnostics.Conditional("UNITY_EDITOR")]
+    private static void Log(string msg)
+    {
+        if (Instance != null && Instance.verboseLogs) Debug.Log(msg);
+    }
 
     public Transform HeadVRTarget => headVRTarget;
     public Transform LeftHandVRTarget => leftHandVRTarget;
@@ -72,6 +101,12 @@ public class LocalXROriginProvider : MonoBehaviour
     public bool HasSpawn { get; private set; }
     public Vector3 SpawnPosition { get; private set; }
     public Quaternion SpawnRotation { get; private set; }
+
+    /// <summary>True while the first spawn or a fall respawn is running.</summary>
+    public bool IsRespawning => _respawning || _settling;
+
+    /// <summary>True while the player is frozen by a ball.</summary>
+    public bool IsFrozen => _freezeRoutine != null;
 
     private Vector3 _initialPosition;
     private Quaternion _initialRotation;
@@ -89,6 +124,30 @@ public class LocalXROriginProvider : MonoBehaviour
     private float _nextAvatarSearch;
     private bool _respawning;
     private bool _settling;
+
+    // jump sound state
+    private VRJumpMotor _jumpMotor;
+    private float _nextJumpSfxTime;
+
+    // hit effects state (knockback / freeze / haptics)
+    private Coroutine _knockbackRoutine;
+    private Coroutine _freezeRoutine;
+    private Coroutine _hapticRoutine;
+    private float _freezeUntil;
+
+    private void OnEnable()
+    {
+        // the jump sound plays exactly when VRJumpMotor starts a jump
+        _jumpMotor = Root.GetComponent<VRJumpMotor>();
+        if (_jumpMotor != null) _jumpMotor.Jumped += OnJumped;
+        else Debug.LogWarning("[LocalXROriginProvider] No VRJumpMotor found on the XR Origin, so no jump sound can play.");
+    }
+
+    private void OnDisable()
+    {
+        if (_jumpMotor != null) _jumpMotor.Jumped -= OnJumped;
+        _jumpMotor = null;
+    }
 
     private void Awake()
     {
@@ -134,6 +193,180 @@ public class LocalXROriginProvider : MonoBehaviour
     {
         // While locked the rig is held exactly in place, no matter what else tries to move it
         if (_pinned) Root.position = _pinPosition;
+    }
+
+    // ------------------------------------------------------------------ jump sound
+
+    /// <summary>Called by VRJumpMotor at the moment a jump starts.</summary>
+    private void OnJumped()
+    {
+        if (jumpSfx == null) return;
+        if (_respawning || _settling || _pinned) return;   // never while frozen / respawning
+        if (Time.time < _nextJumpSfxTime) return;
+
+        _nextJumpSfxTime = Time.time + jumpSfxCooldown;
+        float pitch = 1f + UnityEngine.Random.Range(-jumpPitchVariation, jumpPitchVariation);
+        PlaySfx2D(jumpSfx, jumpSfxVolume, pitch, "jump");
+    }
+
+    // ------------------------------------------------------------------ hit effects (called by HandBall on the VICTIM's own machine)
+
+    /// <summary>
+    /// Pushes the player back like a stumble: horizontally, in the given world direction, over 'duration' seconds
+    /// (fast at the start, slowing down). Uses the CharacterController, so walls still stop the player.
+    /// </summary>
+    public void Knockback(Vector3 worldDirection, float distance, float duration)
+    {
+        if (IsRespawning || _pinned)
+        {
+            Log("[LocalXROriginProvider] Knockback skipped: the player is respawning or frozen.");
+            return;
+        }
+
+        worldDirection.y = 0f;
+        if (worldDirection.sqrMagnitude < 0.0001f)
+        {
+            Debug.LogWarning("[LocalXROriginProvider] Knockback skipped: the push direction is straight up or down.");
+            return;
+        }
+
+        if (_knockbackRoutine != null) StopCoroutine(_knockbackRoutine);
+        _knockbackRoutine = StartCoroutine(KnockbackRoutine(worldDirection.normalized, Mathf.Max(0f, distance), Mathf.Max(0.05f, duration)));
+    }
+
+    private IEnumerator KnockbackRoutine(Vector3 dir, float distance, float duration)
+    {
+        Log($"[LocalXROriginProvider] KNOCKBACK started: direction {dir}, {distance:F2} m over {duration:F2}s.");
+
+        Transform root = Root;
+        var cc = root.GetComponent<CharacterController>();
+        Vector3 startPos = root.position;
+
+        float t = 0f;
+        float previous = 0f;
+        while (t < duration)
+        {
+            if (_pinned || _respawning || _settling)
+            {
+                Log("[LocalXROriginProvider] Knockback stopped early: the player was frozen or respawned.");
+                break;
+            }
+
+            t += Time.deltaTime;
+            float k = Mathf.Clamp01(t / duration);
+            float eased = 1f - (1f - k) * (1f - k);       // fast at first, then slowing down
+            float current = distance * eased;
+            Vector3 step = dir * (current - previous);
+            previous = current;
+
+            if (cc != null && cc.enabled) cc.Move(step);   // respects walls
+            else root.position += step;
+
+            yield return null;
+        }
+
+        Log($"[LocalXROriginProvider] KNOCKBACK finished: moved {Vector3.Distance(startPos, root.position):F2} m.");
+        _knockbackRoutine = null;
+    }
+
+    /// <summary>
+    /// Freezes the player on the spot for 'seconds' (no walking, turning or jumping), then gives control back.
+    /// Hitting an already frozen player extends the freeze.
+    /// </summary>
+    public void Freeze(float seconds)
+    {
+        if (seconds <= 0f) return;
+
+        if (IsRespawning)
+        {
+            Log("[LocalXROriginProvider] Freeze skipped: the player is respawning (already held in place).");
+            return;
+        }
+
+        _freezeUntil = Mathf.Max(_freezeUntil, Time.time + seconds);
+
+        if (_freezeRoutine != null)
+        {
+            Log($"[LocalXROriginProvider] Already frozen, freeze extended to {_freezeUntil - Time.time:F1}s from now.");
+            return;
+        }
+
+        _freezeRoutine = StartCoroutine(FreezeRoutine());
+    }
+
+    private IEnumerator FreezeRoutine()
+    {
+        if (_knockbackRoutine != null)
+        {
+            StopCoroutine(_knockbackRoutine);
+            _knockbackRoutine = null;
+        }
+
+        SetMovementLocked(true);
+        Log($"[LocalXROriginProvider] FROZEN for {_freezeUntil - Time.time:F1}s.");
+
+        while (Time.time < _freezeUntil)
+        {
+            if (_respawning || _settling) break;    // a respawn takes over the lock and releases it itself
+            yield return null;
+        }
+
+        if (_respawning || _settling)
+        {
+            Log("[LocalXROriginProvider] Freeze ended early because a respawn started (the respawn releases the lock).");
+        }
+        else if (_pinned)
+        {
+            ResetFallVelocity();
+            SetMovementLocked(false);
+            Log("[LocalXROriginProvider] UNFROZEN: the player can move again.");
+        }
+
+        _freezeUntil = 0f;
+        _freezeRoutine = null;
+    }
+
+    /// <summary>
+    /// Vibrates both controllers, strongest at the start and fading out, like something hit the player.
+    /// strength 0..1, duration in seconds.
+    /// </summary>
+    public void PlayHaptics(float strength, float duration)
+    {
+        if (strength <= 0f || duration <= 0f) return;
+
+        // ONE call per controller. No coroutine, no repeated pulses.
+        strength = Mathf.Clamp01(strength);
+        SendHaptic(UnityEngine.XR.XRNode.LeftHand, strength, duration);
+        SendHaptic(UnityEngine.XR.XRNode.RightHand, strength, duration);
+    }
+
+    private static void SendHaptic(UnityEngine.XR.XRNode node, float amplitude, float seconds)
+    {
+        var device = UnityEngine.XR.InputDevices.GetDeviceAtXRNode(node);
+        if (device.isValid
+            && device.TryGetHapticCapabilities(out UnityEngine.XR.HapticCapabilities caps)
+            && caps.supportsImpulse)
+            device.SendHapticImpulse(0u, amplitude, seconds);
+    }
+
+    [ContextMenu("Debug: Test knockback (backwards)")]
+    private void DebugKnockback()
+    {
+        var cam = RigCamera;
+        Vector3 back = cam != null ? -cam.transform.forward : -Root.forward;
+        Knockback(back, 1.5f, 0.35f);
+    }
+
+    [ContextMenu("Debug: Test freeze (3 s)")]
+    private void DebugFreeze()
+    {
+        Freeze(3f);
+    }
+
+    [ContextMenu("Debug: Test haptics")]
+    private void DebugHaptics()
+    {
+        PlayHaptics(1f, 0.6f);
     }
 
     // ------------------------------------------------------------------ spawn
@@ -192,13 +425,13 @@ public class LocalXROriginProvider : MonoBehaviour
     {
         if (!useCheckpointRespawn)
         {
-            Debug.Log("[LocalXROriginProvider] Checkpoint respawn is switched off, using the normal spawn.");
+            Log("[LocalXROriginProvider] Checkpoint respawn is switched off, using the normal spawn.");
             return;
         }
 
         if (!Checkpoint.TryGetRespawnPose(out Vector3 cpPos, out Quaternion cpRot))
         {
-            Debug.Log($"[LocalXROriginProvider] No checkpoint reached yet, respawning at the normal spawn {SpawnPosition}.");
+            Log($"[LocalXROriginProvider] No checkpoint reached yet, respawning at the normal spawn {SpawnPosition}.");
             return;
         }
 
@@ -212,7 +445,7 @@ public class LocalXROriginProvider : MonoBehaviour
 
         SpawnPosition = safe;
         SpawnRotation = cpRot;
-        Debug.Log($"[LocalXROriginProvider] Respawning at the CHECKPOINT: {cpPos} -> {safe} (yaw {cpRot.eulerAngles.y:F0}).");
+        Log($"[LocalXROriginProvider] Respawning at the CHECKPOINT: {cpPos} -> {safe} (yaw {cpRot.eulerAngles.y:F0}).");
     }
 
     /// <summary>Respawn at the XR Origin's original scene position from now on.</summary>
@@ -244,7 +477,7 @@ public class LocalXROriginProvider : MonoBehaviour
         Vector3 newPos = target - newRot * headLocal;
         newPos.y = target.y;
 
-        Debug.Log($"[LocalXROriginProvider] Placing head at {target} (head is {headLocal.magnitude:F2} m from the rig origin).");
+        Log($"[LocalXROriginProvider] Placing head at {target} (head is {headLocal.magnitude:F2} m from the rig origin).");
         MoveRoot(newPos, newRot);
     }
 
@@ -258,14 +491,14 @@ public class LocalXROriginProvider : MonoBehaviour
         err.y = 0f;
         if (err.magnitude < 0.1f) return;
 
-        Debug.Log($"[LocalXROriginProvider] Head was {err.magnitude:F2} m away from the spawn point, shifting the rig.");
+        Log($"[LocalXROriginProvider] Head was {err.magnitude:F2} m away from the spawn point, shifting the rig.");
         MoveRoot(Root.position + err, Root.rotation);
     }
 
     public void MoveRoot(Vector3 position, Quaternion rotation)
     {
         Transform root = Root;
-        Debug.Log($"[LocalXROriginProvider] Moving '{root.name}' from {root.position} to {position}");
+        Log($"[LocalXROriginProvider] Moving '{root.name}' from {root.position} to {position}");
 
         var cc = root.GetComponent<CharacterController>();
         bool wasEnabled = cc != null && cc.enabled;
@@ -299,11 +532,11 @@ public class LocalXROriginProvider : MonoBehaviour
                 if (b != null && b.GetType().Name == "NetworkFallRespawn" && b.enabled)
                 {
                     b.enabled = false;
-                    Debug.Log("[LocalXROriginProvider] Disabled the old NetworkFallRespawn component on the avatar.");
+                    Log("[LocalXROriginProvider] Disabled the old NetworkFallRespawn component on the avatar.");
                 }
             }
 
-            Debug.Log("[LocalXROriginProvider] Fall respawn is active (v7, checkpoint aware).");
+            Log("[LocalXROriginProvider] Fall respawn is active (v10, checkpoint aware, fall + jump sounds, hit effects).");
             return;
         }
     }
@@ -311,7 +544,10 @@ public class LocalXROriginProvider : MonoBehaviour
     private IEnumerator FallRespawnRoutine()
     {
         _respawning = true;
-        Debug.Log($"[LocalXROriginProvider] Fall detected. Rig={Root.position}, current spawn={SpawnPosition}, hasCheckpoint={Checkpoint.HasCheckpoint}");
+        Log($"[LocalXROriginProvider] Fall detected. Rig={Root.position}, current spawn={SpawnPosition}, hasCheckpoint={Checkpoint.HasCheckpoint}");
+
+        if (fallSfx != null) PlaySfx2D(fallSfx, fallSfxVolume, 1f, "fall");
+        else Log("[LocalXROriginProvider] No fall sound assigned (Fall Sfx is empty).");
 
         var fader = VRScreenFader.Instance;
         float hold = Mathf.Max(0f, totalDuration - fadeOutDuration - fadeInDuration);
@@ -348,6 +584,24 @@ public class LocalXROriginProvider : MonoBehaviour
         _respawning = false;
     }
 
+    /// <summary>Plays a clip as a flat (2D) sound, so it is heard fully and is not left behind when the rig teleports.</summary>
+    private static void PlaySfx2D(AudioClip clip, float volume, float pitch, string label)
+    {
+        if (clip == null) return;
+
+        var go = new GameObject("SFX_" + clip.name);
+        var src = go.AddComponent<AudioSource>();
+        src.clip = clip;
+        src.volume = volume;
+        src.pitch = pitch;
+        src.spatialBlend = 0f;
+        src.playOnAwake = false;
+        src.Play();
+        UnityEngine.Object.Destroy(go, clip.length / Mathf.Max(0.1f, pitch) + 0.25f);
+
+        Log($"[LocalXROriginProvider] Played {label} sound '{clip.name}' (volume {volume:F2}, pitch {pitch:F2}).");
+    }
+
     private IEnumerator DiagnosticsLater()
     {
         yield return new WaitForSeconds(1f);
@@ -369,26 +623,43 @@ public class LocalXROriginProvider : MonoBehaviour
         var motor = Root.GetComponent<VRJumpMotor>();
         if (motor != null) motor.ResetVelocity();
 
-        Debug.Log($"[LocalXROriginProvider] Reset {zeroed.Count} leftover velocity field(s): {string.Join(", ", zeroed)}");
+        Log($"[LocalXROriginProvider] Reset {zeroed.Count} leftover velocity field(s): {string.Join(", ", zeroed)}");
     }
 
-    private static void ZeroRuntimeVelocity(Behaviour b, List<string> zeroed)
-    {
-        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
+    // Looking up fields with reflection is slow, so it is done once per component type.
+    private static readonly Dictionary<Type, FieldInfo[]> VelocityFieldCache = new Dictionary<Type, FieldInfo[]>();
 
-        for (Type t = b.GetType(); t != null && t != typeof(MonoBehaviour) && t != typeof(Behaviour); t = t.BaseType)
+    private static FieldInfo[] GetVelocityFields(Type type)
+    {
+        if (VelocityFieldCache.TryGetValue(type, out var cached)) return cached;
+
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
+        var result = new List<FieldInfo>();
+
+        for (Type t = type; t != null && t != typeof(MonoBehaviour) && t != typeof(Behaviour); t = t.BaseType)
         {
             foreach (var f in t.GetFields(flags))
             {
                 if (f.IsPublic || f.IsDefined(typeof(SerializeField), true)) continue; // settings, not runtime state
                 if (f.Name.IndexOf("velocity", StringComparison.OrdinalIgnoreCase) < 0) continue;
-
-                if (f.FieldType == typeof(Vector3)) f.SetValue(b, Vector3.zero);
-                else if (f.FieldType == typeof(float)) f.SetValue(b, 0f);
-                else continue;
-
-                zeroed.Add(t.Name + "." + f.Name);
+                if (f.FieldType != typeof(Vector3) && f.FieldType != typeof(float)) continue;
+                result.Add(f);
             }
+        }
+
+        var array = result.ToArray();
+        VelocityFieldCache[type] = array;
+        return array;
+    }
+
+    private static void ZeroRuntimeVelocity(Behaviour b, List<string> zeroed)
+    {
+        foreach (var f in GetVelocityFields(b.GetType()))
+        {
+            if (f.FieldType == typeof(Vector3)) f.SetValue(b, Vector3.zero);
+            else f.SetValue(b, 0f);
+
+            zeroed.Add(f.DeclaringType.Name + "." + f.Name);
         }
     }
 
@@ -396,7 +667,7 @@ public class LocalXROriginProvider : MonoBehaviour
 
     /// <summary>
     /// Locks/unlocks everything that moves the rig (move/turn/gravity providers, VRJumpMotor, CharacterController),
-    /// and holds the rig in place, so the player cannot fall or walk while the screen is black.
+    /// and holds the rig in place, so the player cannot fall or walk while the screen is black (or while frozen).
     /// Only components that were enabled before are switched back on.
     /// </summary>
     public void SetMovementLocked(bool locked)
@@ -405,9 +676,9 @@ public class LocalXROriginProvider : MonoBehaviour
         {
             if (_locked.Count > 0 || _pinned) return;
 
-            foreach (var b in Root.root.GetComponentsInChildren<Behaviour>(false))
+            foreach (var b in GetLockCandidates())
             {
-                if (ShouldLock(b))
+                if (b != null && b.isActiveAndEnabled)
                 {
                     b.enabled = false;
                     _locked.Add(b);
@@ -433,7 +704,7 @@ public class LocalXROriginProvider : MonoBehaviour
             _pinPosition = Root.position;
             _pinned = true;
 
-            Debug.Log($"[LocalXROriginProvider] Movement locked ({_locked.Count} component(s) disabled).");
+            Log($"[LocalXROriginProvider] Movement locked ({_locked.Count} component(s) disabled).");
         }
         else
         {
@@ -447,13 +718,36 @@ public class LocalXROriginProvider : MonoBehaviour
                 if (b != null) b.enabled = true;
             _locked.Clear();
 
-            Debug.Log("[LocalXROriginProvider] Movement unlocked.");
+            Log("[LocalXROriginProvider] Movement unlocked.");
         }
     }
 
-    private static bool ShouldLock(Behaviour b)
+    // The movement components of the rig are searched ONCE and remembered, so freezing a player
+    // (which happens on every hit) no longer scans the whole rig each time.
+    private Behaviour[] _lockCandidates;
+
+    private Behaviour[] GetLockCandidates()
     {
-        if (b == null || !b.enabled) return false;
+        bool stale = _lockCandidates == null;
+        if (!stale)
+        {
+            for (int i = 0; i < _lockCandidates.Length; i++)
+                if (_lockCandidates[i] == null) { stale = true; break; }   // something was destroyed: search again
+        }
+
+        if (stale)
+        {
+            var list = new List<Behaviour>();
+            foreach (var b in Root.root.GetComponentsInChildren<Behaviour>(true))
+                if (IsLockType(b)) list.Add(b);
+            _lockCandidates = list.ToArray();
+        }
+        return _lockCandidates;
+    }
+
+    private static bool IsLockType(Behaviour b)
+    {
+        if (b == null) return false;
         if (b is VRJumpMotor) return true;
 
         var t = b.GetType();
@@ -508,7 +802,7 @@ public class LocalXROriginProvider : MonoBehaviour
         if (found)
         {
             Vector3 snapped = point + Vector3.up * groundOffset;
-            Debug.Log($"[LocalXROriginProvider] Spawn snapped to ground '{hitName}': {position} -> {snapped}");
+            Log($"[LocalXROriginProvider] Spawn snapped to ground '{hitName}': {position} -> {snapped}");
             return snapped;
         }
 
@@ -560,6 +854,6 @@ public class LocalXROriginProvider : MonoBehaviour
         sb.Append("Ground below BODY: ").Append(DescribeGroundBelow(bodyCenter, root)).Append(". ");
         sb.Append("Ground below ROOT: ").Append(DescribeGroundBelow(root.position + Vector3.up, root)).Append(".");
 
-        Debug.Log(sb.ToString());
+        Log(sb.ToString());
     }
 }
