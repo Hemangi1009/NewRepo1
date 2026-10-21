@@ -27,6 +27,10 @@ public class SlowSurface : MonoBehaviour
     [Tooltip("Seconds to blend between normal and slow speed (so it does not feel like a sudden stop).")]
     [SerializeField] private float transitionTime = 0.15f;
 
+    [Header("Jumping")]
+    [Tooltip("ON: the player cannot jump while standing on a slow surface. Jumping works again as soon as they step off.")]
+    [SerializeField] private bool blockJumping = true;
+
     [Header("Ground check")]
     [SerializeField] private float checkDistance = 0.4f;
 
@@ -45,6 +49,7 @@ public class SlowSurface : MonoBehaviour
     private readonly List<SpeedTarget> _targets = new List<SpeedTarget>();
     private readonly HashSet<Collider> _slowSet = new HashSet<Collider>();
     private CharacterController _cc;
+    private VRJumpMotor _jumpMotor;
     private float _current = 1f;
     private float _applied = 1f;
 
@@ -65,19 +70,30 @@ public class SlowSurface : MonoBehaviour
     private void Start()
     {
         FindMoveProviders();
+
+        _jumpMotor = GetComponent<VRJumpMotor>();
+        if (_jumpMotor == null) _jumpMotor = transform.root.GetComponentInChildren<VRJumpMotor>(true);
+        if (blockJumping && _jumpMotor == null)
+            Debug.LogWarning("[SlowSurface] 'Block Jumping' is on but no VRJumpMotor was found on the XR rig.", this);
     }
 
     private void OnDisable()
     {
         Apply(1f); // never leave the player slowed down
         _current = 1f;
+        if (_jumpMotor != null) _jumpMotor.JumpBlocked = false; // never leave the player unable to jump
     }
 
     private void Update()
     {
+        bool onSlow = IsOnSlowSurface();
+
+        // no jumping while on the surface, jumping is back as soon as the player steps off
+        if (_jumpMotor != null) _jumpMotor.JumpBlocked = blockJumping && onSlow;
+
         if (_targets.Count == 0) return;
 
-        float target = IsOnSlowSurface() ? speedMultiplier : 1f;
+        float target = onSlow ? speedMultiplier : 1f;
         float step = (1f - speedMultiplier) / Mathf.Max(0.01f, transitionTime) * Time.deltaTime;
         _current = Mathf.MoveTowards(_current, target, step);
 

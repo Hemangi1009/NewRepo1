@@ -181,8 +181,8 @@ MonoBehaviour:
   verboseLogs: 0
   startScale: 0.05
   endScale: 0.1
-  growTime: 1.5
-  throwSpeed: 12
+  growTime: 1
+  throwSpeed: 50
   maxDistance: 30
   hitRadius: 0.25
   hitMask:
@@ -207,6 +207,11 @@ MonoBehaviour:
   freezeSeconds: 3
   hitHapticStrength: 1
   hitHapticDuration: 0.6
+  showAimLine: 1
+  aimLineColor: {r: 0.7783019, g: 0.9722877, b: 1, a: 1}
+  aimLineWidth: 0.01
+  aimStartOffset: 0.2
+  aimLineMaterial: {fileID: 2100000, guid: d9f64910e310f534aaf1b0d50923dae2, type: 2}
   _NetState: 0
   _Charge: 0
 --- !u!1 &5687894619659632902

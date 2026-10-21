@@ -139,6 +139,12 @@ public class VRJumpMotor : MonoBehaviour
              "OFF: the Move Provider handles gravity and this script only adds the jump impulse.")]
     [SerializeField] private bool handleGravity = true;
 
+    /// <summary>
+    /// While true the jump button does nothing (no jump, no remembered press, no coyote jump).
+    /// Spring pads (Launch) still work. SlowSurface sets this while the player stands on mud / sand / water.
+    /// </summary>
+    public bool JumpBlocked { get; set; }
+
     /// <summary>Raised the moment a button jump starts (not for spring pad launches). The jump sound listens to this.</summary>
     public event System.Action Jumped;
 
@@ -221,10 +227,12 @@ public class VRJumpMotor : MonoBehaviour
         }
 
         // ---- jump (with buffer + coyote time)
-        if (_jump.WasPressedThisFrame())
+        if (JumpBlocked)
+            _jumpBufferedUntil = -10f;     // a press while blocked is NOT remembered, so no surprise jump when the block ends
+        else if (_jump.WasPressedThisFrame())
             _jumpBufferedUntil = Time.time + jumpBufferTime;
 
-        bool canJump = Time.time - _lastGroundedTime <= coyoteTime;
+        bool canJump = !JumpBlocked && Time.time - _lastGroundedTime <= coyoteTime;
         if (canJump && Time.time <= _jumpBufferedUntil)
         {
             _velY = Mathf.Sqrt(jumpHeight * -2f * gravity);
